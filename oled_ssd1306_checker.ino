@@ -1,19 +1,35 @@
 /**
  * @file oled_ssd1306_checker.ino
  * @author Chimipupu(https://github.com/Chimipupu)
- * @brief OLED SSD1306の画面検査ファームウェア(マイコン: RP2040)
- * @version 0.1
+ * @brief OLED SSD1306の画面検査ファームウェア(マイコン: RP2040 デュアルコア構成)
+ *        - Core 0 (ドライバCPU): I2Cバス専有、OLED接続/抜去監視、GDDRAM転送、レジスタ制御
+ *        - Core 1 (アプリCPU)  : 検査シーケンス制御、フレームバッファ描画、Serialログ出力
+ * @version 0.2
  * @date 2026-11-14
  * @copyright Copyright (c) 2026 Chimipupu All Rights Reserved.
  */
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <string.h>
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 
 // -----------------------------------------------------------
+const uint8_t OLED_CONTRAST_LEVELS[] = { 0x00U, 0x20U, 0x7FU, 0xFFU };
+const uint8_t OLED_CONTRAST_LEVEL_CNT = (uint8_t)(sizeof(OLED_CONTRAST_LEVELS) / sizeof(OLED_CONTRAST_LEVELS[0]));
+
+const uint8_t OLED_MUX_RATIOS[] = { 15U, 23U, 31U };
+const uint8_t OLED_MUX_RATIO_CNT = (uint8_t)(sizeof(OLED_MUX_RATIOS) / sizeof(OLED_MUX_RATIOS[0]));
+
+// -----------------------------------------------------------
+#if 0
+#define I2C_SCL_DEF           (400000) // I2C 400KHz
+#else
+#define I2C_SCL_DEF          (1000000) // I2C 1MHz
+#endif
+
 #define SCREEN_WIDTH            (128)
 #define SCREEN_HEIGHT           (32)
 #define SCREEN_BUF_SIZE         ((SCREEN_WIDTH * SCREEN_HEIGHT) / 8)
@@ -39,20 +55,71 @@
 #define WAIT_ROT_EACH_MS        (600)
 #define WAIT_SCROLL_EACH_MS     (1000)
 #define POLL_INTERVAL_MS        (50)
+#define FIFO_TIMEOUT_MS         (500)
 
+// コア間FIFO コマンドID
+#define DRV_CMD_FLUSH_FRAME     (0x01U)
+#define DRV_CMD_SEND_CMD1       (0x02U)
+#define DRV_CMD_SEND_CMD2       (0x03U)
+#define DRV_CMD_PAGE_FRAME      (0x04U)
+#define DRV_CMD_SCROLL_CTRL     (0x05U)
+#define DRV_CMD_READ_STATUS     (0x06U)
+
+// スクロール制御サブコマンド
+#define DRV_SCROLL_STOP         (0x00U)
+#define DRV_SCROLL_RIGHT        (0x01U)
+#define DRV_SCROLL_LEFT         (0x02U)
+#define DRV_SCROLL_DIAG_RIGHT   (0x03U)
+#define DRV_SCROLL_DIAG_LEFT    (0x04U)
+
+// 応答マーカー
+#define DRV_RESP_MARKER         (0x80U)
+
+// 32bit FIFOメッセージ パック/アンパックマクロ
+#define DRV_MSG_PACK(cmd, a1, a2, a3) \
+    (((uint32_t)(cmd) << 24U) | ((uint32_t)(a1) << 16U) | ((uint32_t)(a2) << 8U) | (uint32_t)(a3))
+
+#define DRV_MSG_CMD(msg)        ((uint8_t)(((msg) >> 24U) & 0xFFU))
+#define DRV_MSG_ARG1(msg)       ((uint8_t)(((msg) >> 16U) & 0xFFU))
+#define DRV_MSG_ARG2(msg)       ((uint8_t)(((msg) >> 8U)  & 0xFFU))
+#define DRV_MSG_ARG3(msg)       ((uint8_t)((msg) & 0xFFU))
+
+// -----------------------------------------------------------
+// [CPUコア間共有変数 (コア間状態通知)]
+volatile bool g_is_oled_connected = false;
+volatile bool g_is_core0_ready = false;
+
+// -----------------------------------------------------------
+// [Static変数]
 static Adafruit_SSD1306 s_display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
-static bool s_is_connected = false;
+static uint8_t s_tx_buf[SCREEN_BUF_SIZE];
+static uint32_t s_last_poll_ms = 0;
 
-static bool _is_oled_ack(void);
-static bool _read_oled_status(uint8_t *p_status);
-static bool _write_page_pattern(uint8_t page, uint8_t pattern);
+// -----------------------------------------------------------
+// [プロトタイプ宣言: Core 0 ドライバCPU]
+static bool _drv_is_oled_ack(void);
+static bool _drv_read_oled_status(uint8_t *p_status);
+static bool _drv_flush_tx_buf(void);
+static bool _drv_write_page_buffer(uint8_t page, const uint8_t *p_page_data, bool is_invert);
+static bool _drv_exec_page_frame(uint8_t invert_mask);
+static void _drv_exec_scroll(uint8_t mode, uint8_t start_page, uint8_t end_page);
+static void _drv_handle_fifo_msg(uint32_t msg);
+
+// -----------------------------------------------------------
+// [プロトタイプ宣言: Core 1 アプリCPU RPCラッパー & ユーティリティ]
+static bool _app_req_driver(uint32_t msg, uint8_t *p_ret_val);
+static bool _app_flush_display(void);
+static bool _app_send_cmd1(uint8_t cmd);
+static bool _app_send_cmd2(uint8_t cmd, uint8_t param);
+static bool _app_page_frame(uint8_t invert_mask);
+static bool _app_scroll_ctrl(uint8_t mode, uint8_t start_page, uint8_t end_page);
+static bool _app_read_status(uint8_t *p_status);
 static bool _wait_ms_with_detect(uint32_t wait_ms);
-static bool _write_page_buffer(uint8_t page, const uint8_t *p_page_data, bool is_invert);
 
-// 検査関数ポインタ
+// 検査関数ポインタ型
 typedef bool (*oled_test_func_t)(void);
 
-// 検査関数プロト
+// 検査関数プロトタイプ
 static bool _test_all_pixels(void);
 static bool _test_entire_display_on(void);
 static bool _test_display_on_off(void);
@@ -110,13 +177,15 @@ static const oled_test_func_t s_oled_test_func_tbl[] = {
 };
 
 const uint8_t OLED_TEST_FUNC_TBL_CNT = (uint8_t)(sizeof(s_oled_test_func_tbl) / sizeof(s_oled_test_func_tbl[0]));
-// -----------------------------------------------------------
-// [Static関数]
+
+// ===========================================================
+// [Core 0 : ドライバCPU 実装領域 (I2Cバス完全専有)]
+// ===========================================================
 
 /**
  * @brief I2Cバス上でOLEDの応答(ACK)があるか確認
  */
-static bool _is_oled_ack(void)
+static bool _drv_is_oled_ack(void)
 {
     uint8_t err = 0;
 
@@ -129,7 +198,7 @@ static bool _is_oled_ack(void)
 /**
  * @brief SSD1306のステータスレジスタをI2C経由で1バイト読み出す
  */
-static bool _read_oled_status(uint8_t *p_status)
+static bool _drv_read_oled_status(uint8_t *p_status)
 {
     uint8_t read_cnt = 0;
 
@@ -147,25 +216,26 @@ static bool _read_oled_status(uint8_t *p_status)
 }
 
 /**
- * @brief Page Addressing Modeで指定ページ(128バイト)にパターンを書き込む
+ * @brief ドライバ側ダブルバッファ(s_tx_buf)をGDDRAMへ全画面転送する
  */
-static bool _write_page_pattern(uint8_t page, uint8_t pattern)
+static bool _drv_flush_tx_buf(void)
 {
-    uint8_t offset = 0;
+    uint16_t offset = 0;
     uint8_t i = 0;
     uint8_t err = 0;
 
-    // ページアドレス(0xB0〜0xB7)とカラム開始位置(0x00, 0x10)を指定
-    s_display.ssd1306_command((uint8_t)(0xB0U | (page & 0x07U)));
-    s_display.ssd1306_command(SSD1306_SETLOWCOLUMN | 0x00U);
-    s_display.ssd1306_command(SSD1306_SETHIGHCOLUMN | 0x00U);
+    s_display.ssd1306_command(SSD1306_COLUMNADDR);
+    s_display.ssd1306_command(0x00U);
+    s_display.ssd1306_command((uint8_t)(SCREEN_WIDTH - 1));
+    s_display.ssd1306_command(SSD1306_PAGEADDR);
+    s_display.ssd1306_command(0x00U);
+    s_display.ssd1306_command((uint8_t)(OLED_PAGE_CNT - 1));
 
-    // I2Cバッファ溢れ防止のため16バイト単位で分割送信
-    for (offset = 0; offset < SCREEN_WIDTH; offset += OLED_I2C_CHUNK_SIZE) {
+    for (offset = 0; offset < SCREEN_BUF_SIZE; offset += OLED_I2C_CHUNK_SIZE) {
         Wire.beginTransmission(OLED_I2C_ADDR);
         Wire.write((uint8_t)0x40U); // Co=0, D/C#=1 (GDDRAMデータ書き込み)
         for (i = 0; i < OLED_I2C_CHUNK_SIZE; i++) {
-            Wire.write(pattern);
+            Wire.write(s_tx_buf[offset + i]);
         }
         err = Wire.endTransmission();
         if (err != 0) {
@@ -177,7 +247,259 @@ static bool _write_page_pattern(uint8_t page, uint8_t pattern)
 }
 
 /**
- * @brief 抜去を監視しながら指定時間待機する（抜かれたらfalseを返す）
+ * @brief Page Addressing Modeで指定ページ(128バイト)に任意バッファを書き込む
+ */
+static bool _drv_write_page_buffer(uint8_t page, const uint8_t *p_page_data, bool is_invert)
+{
+    uint8_t offset = 0;
+    uint8_t i = 0;
+    uint8_t err = 0;
+    uint8_t data_byte = 0;
+
+    if (p_page_data == NULL) {
+        return false;
+    }
+
+    s_display.ssd1306_command((uint8_t)(0xB0U | (page & 0x07U)));
+    s_display.ssd1306_command(SSD1306_SETLOWCOLUMN | 0x00U);
+    s_display.ssd1306_command(SSD1306_SETHIGHCOLUMN | 0x00U);
+
+    for (offset = 0; offset < SCREEN_WIDTH; offset += OLED_I2C_CHUNK_SIZE) {
+        Wire.beginTransmission(OLED_I2C_ADDR);
+        Wire.write((uint8_t)0x40U);
+        for (i = 0; i < OLED_I2C_CHUNK_SIZE; i++) {
+            data_byte = p_page_data[offset + i];
+            if (is_invert) {
+                data_byte = (uint8_t)(~data_byte);
+            }
+            Wire.write(data_byte);
+        }
+        err = Wire.endTransmission();
+        if (err != 0) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+/**
+ * @brief Page Addressing Modeで全ページを転送後、Horizontal Modeへ復帰する
+ */
+static bool _drv_exec_page_frame(uint8_t invert_mask)
+{
+    uint8_t page = 0;
+    bool is_ok = true;
+    bool is_inv = false;
+
+    s_display.ssd1306_command(SSD1306_MEMORYMODE);
+    s_display.ssd1306_command(0x02U);
+
+    for (page = 0; page < OLED_PAGE_CNT; page++) {
+        is_inv = (((invert_mask >> page) & 0x01U) != 0);
+        if (!_drv_write_page_buffer(page, &s_tx_buf[(uint16_t)page * SCREEN_WIDTH], is_inv)) {
+            is_ok = false;
+            break;
+        }
+    }
+
+    // Horizontal Addressing Mode (0x00) へ必ず復帰
+    s_display.ssd1306_command(SSD1306_MEMORYMODE);
+    s_display.ssd1306_command(0x00U);
+    s_display.ssd1306_command(SSD1306_COLUMNADDR);
+    s_display.ssd1306_command(0x00U);
+    s_display.ssd1306_command((uint8_t)(SCREEN_WIDTH - 1));
+    s_display.ssd1306_command(SSD1306_PAGEADDR);
+    s_display.ssd1306_command(0x00U);
+    s_display.ssd1306_command((uint8_t)(OLED_PAGE_CNT - 1));
+
+    return is_ok;
+}
+
+/**
+ * @brief ハードウェアスクロール制御を実行する
+ */
+static void _drv_exec_scroll(uint8_t mode, uint8_t start_page, uint8_t end_page)
+{
+    switch (mode) {
+        case DRV_SCROLL_RIGHT:
+            s_display.startscrollright(start_page, end_page);
+            break;
+        case DRV_SCROLL_LEFT:
+            s_display.startscrollleft(start_page, end_page);
+            break;
+        case DRV_SCROLL_DIAG_RIGHT:
+            s_display.startscrolldiagright(start_page, end_page);
+            break;
+        case DRV_SCROLL_DIAG_LEFT:
+            s_display.startscrolldiagleft(start_page, end_page);
+            break;
+        case DRV_SCROLL_STOP:
+        default:
+            s_display.stopscroll();
+            break;
+    }
+}
+
+/**
+ * @brief Core 1から受信したFIFOコマンドを解析・実行する
+ */
+static void _drv_handle_fifo_msg(uint32_t msg)
+{
+    uint8_t cmd = DRV_MSG_CMD(msg);
+    uint8_t arg1 = DRV_MSG_ARG1(msg);
+    uint8_t arg2 = DRV_MSG_ARG2(msg);
+    uint8_t arg3 = DRV_MSG_ARG3(msg);
+    uint8_t *p_src_buf = NULL;
+    uint8_t status_byte = 0;
+    bool is_ok = false;
+
+    if (!g_is_oled_connected) {
+        rp2040.fifo.push(DRV_MSG_PACK(DRV_RESP_MARKER, 0U, 0U, 0U));
+        return;
+    }
+
+    switch (cmd) {
+        case DRV_CMD_FLUSH_FRAME:
+            p_src_buf = s_display.getBuffer();
+            if (p_src_buf != NULL) {
+                // 512バイトを即座にドライバ側バッファへ退避し、Core 1へACKを先行返却
+                memcpy(s_tx_buf, p_src_buf, SCREEN_BUF_SIZE);
+                rp2040.fifo.push(DRV_MSG_PACK(DRV_RESP_MARKER, 1U, 0U, 0U));
+                // I2C転送はCore 1の次フレーム描画と並列で実行
+                if (!_drv_flush_tx_buf()) {
+                    g_is_oled_connected = false;
+                }
+            } else {
+                rp2040.fifo.push(DRV_MSG_PACK(DRV_RESP_MARKER, 0U, 0U, 0U));
+            }
+            return;
+
+        case DRV_CMD_SEND_CMD1:
+            s_display.ssd1306_command(arg1);
+            is_ok = true;
+            break;
+
+        case DRV_CMD_SEND_CMD2:
+            s_display.ssd1306_command(arg1);
+            s_display.ssd1306_command(arg2);
+            is_ok = true;
+            break;
+
+        case DRV_CMD_PAGE_FRAME:
+            p_src_buf = s_display.getBuffer();
+            if (p_src_buf != NULL) {
+                memcpy(s_tx_buf, p_src_buf, SCREEN_BUF_SIZE);
+                rp2040.fifo.push(DRV_MSG_PACK(DRV_RESP_MARKER, 1U, 0U, 0U));
+                if (!_drv_exec_page_frame(arg1)) {
+                    g_is_oled_connected = false;
+                }
+            } else {
+                rp2040.fifo.push(DRV_MSG_PACK(DRV_RESP_MARKER, 0U, 0U, 0U));
+            }
+            return;
+
+        case DRV_CMD_SCROLL_CTRL:
+            _drv_exec_scroll(arg1, arg2, arg3);
+            is_ok = true;
+            break;
+
+        case DRV_CMD_READ_STATUS:
+            is_ok = _drv_read_oled_status(&status_byte);
+            break;
+
+        default:
+            is_ok = false;
+            break;
+    }
+
+    rp2040.fifo.push(DRV_MSG_PACK(DRV_RESP_MARKER, (is_ok ? 1U : 0U), status_byte, 0U));
+}
+
+// ===========================================================
+// [Core 1 : アプリCPU 実装領域 (RPC要求 & 検査ロジック)]
+// ===========================================================
+
+/**
+ * @brief Core 0ドライバへFIFO経由でコマンドを発行し応答を待つ
+ */
+static bool _app_req_driver(uint32_t msg, uint8_t *p_ret_val)
+{
+    uint32_t resp = 0;
+    uint32_t start_ms = millis();
+    bool is_got_resp = false;
+
+    rp2040.fifo.push(msg);
+
+    while ((millis() - start_ms) < FIFO_TIMEOUT_MS) {
+        if (rp2040.fifo.pop_nb(&resp)) {
+            is_got_resp = true;
+            break;
+        }
+        tight_loop_contents();
+    }
+
+    if (!is_got_resp) {
+        return false;
+    }
+
+    if (p_ret_val != NULL) {
+        *p_ret_val = DRV_MSG_ARG2(resp);
+    }
+
+    return (DRV_MSG_ARG1(resp) != 0);
+}
+
+/**
+ * @brief Core 1が描画したフレームバッファの転送をCore 0へ要求
+ */
+static bool _app_flush_display(void)
+{
+    return _app_req_driver(DRV_MSG_PACK(DRV_CMD_FLUSH_FRAME, 0U, 0U, 0U), NULL);
+}
+
+/**
+ * @brief SSD1306の1バイトコマンド送信をCore 0へ要求
+ */
+static bool _app_send_cmd1(uint8_t cmd)
+{
+    return _app_req_driver(DRV_MSG_PACK(DRV_CMD_SEND_CMD1, cmd, 0U, 0U), NULL);
+}
+
+/**
+ * @brief SSD1306の2バイトコマンド送信をCore 0へ要求
+ */
+static bool _app_send_cmd2(uint8_t cmd, uint8_t param)
+{
+    return _app_req_driver(DRV_MSG_PACK(DRV_CMD_SEND_CMD2, cmd, param, 0U), NULL);
+}
+
+/**
+ * @brief Page Addressing Modeでのページ単位転送をCore 0へ要求
+ */
+static bool _app_page_frame(uint8_t invert_mask)
+{
+    return _app_req_driver(DRV_MSG_PACK(DRV_CMD_PAGE_FRAME, invert_mask, 0U, 0U), NULL);
+}
+
+/**
+ * @brief ハードウェアスクロール制御をCore 0へ要求
+ */
+static bool _app_scroll_ctrl(uint8_t mode, uint8_t start_page, uint8_t end_page)
+{
+    return _app_req_driver(DRV_MSG_PACK(DRV_CMD_SCROLL_CTRL, mode, start_page, end_page), NULL);
+}
+
+/**
+ * @brief SSD1306ステータス読み出しをCore 0へ要求
+ */
+static bool _app_read_status(uint8_t *p_status)
+{
+    return _app_req_driver(DRV_MSG_PACK(DRV_CMD_READ_STATUS, 0U, 0U, 0U), p_status);
+}
+
+/**
+ * @brief Core 0が監視する接続フラグを見ながら指定時間待機する
  */
 static bool _wait_ms_with_detect(uint32_t wait_ms)
 {
@@ -185,9 +507,7 @@ static bool _wait_ms_with_detect(uint32_t wait_ms)
     uint32_t step = 0;
 
     while (elapsed < wait_ms) {
-        if (!_is_oled_ack()) {
-            s_is_connected = false;
-            Serial.println(F("OLED Disconnected. Waiting for next unit..."));
+        if (!g_is_oled_connected) {
             return false;
         }
 
@@ -196,7 +516,7 @@ static bool _wait_ms_with_detect(uint32_t wait_ms)
         elapsed += step;
     }
 
-    return true;
+    return g_is_oled_connected;
 }
 
 /**
@@ -206,10 +526,14 @@ static bool _test_all_pixels(void)
 {
     Serial.println(F("All Pixels ON Test"));
 
-    s_display.stopscroll();
+    if (!_app_scroll_ctrl(DRV_SCROLL_STOP, 0U, 0U)) {
+        return false;
+    }
     s_display.setRotation(0);
     s_display.fillScreen(SSD1306_WHITE);
-    s_display.display();
+    if (!_app_flush_display()) {
+        return false;
+    }
 
     return _wait_ms_with_detect(WAIT_ALL_ON_MS);
 }
@@ -226,21 +550,27 @@ static bool _test_entire_display_on(void)
     s_display.setTextColor(SSD1306_WHITE);
     s_display.setCursor(16, 8);
     s_display.print(F("RAM DATA"));
-    s_display.display();
+    if (!_app_flush_display()) {
+        return false;
+    }
 
     if (!_wait_ms_with_detect(WAIT_ENTIRE_ON_MS)) {
         return false;
     }
 
     // GDDRAMを書き換えずに全画素強制点灯
-    s_display.ssd1306_command(SSD1306_DISPLAYALLON);
+    if (!_app_send_cmd1(SSD1306_DISPLAYALLON)) {
+        return false;
+    }
     if (!_wait_ms_with_detect(WAIT_ENTIRE_ON_MS)) {
-        s_display.ssd1306_command(SSD1306_DISPLAYALLON_RESUME);
+        (void)_app_send_cmd1(SSD1306_DISPLAYALLON_RESUME);
         return false;
     }
 
     // GDDRAM表示へ復帰
-    s_display.ssd1306_command(SSD1306_DISPLAYALLON_RESUME);
+    if (!_app_send_cmd1(SSD1306_DISPLAYALLON_RESUME)) {
+        return false;
+    }
     return _wait_ms_with_detect(WAIT_ENTIRE_ON_MS);
 }
 
@@ -260,15 +590,19 @@ static bool _test_display_on_off(void)
     s_display.setTextColor(SSD1306_WHITE);
     s_display.setCursor(22, 12);
     s_display.print(F("ON / OFF TEST"));
-    s_display.display();
+    if (!_app_flush_display()) {
+        return false;
+    }
 
     if (!_wait_ms_with_detect(WAIT_ON_OFF_MS)) {
         return false;
     }
 
     // 画面OFF（スリープ移行）
-    s_display.ssd1306_command(SSD1306_DISPLAYOFF);
-    is_read_ok = _read_oled_status(&status_byte);
+    if (!_app_send_cmd1(SSD1306_DISPLAYOFF)) {
+        return false;
+    }
+    is_read_ok = _app_read_status(&status_byte);
     if (is_read_ok) {
         Serial.print(F("  Status(OFF): 0x"));
         Serial.print(status_byte, HEX);
@@ -278,13 +612,15 @@ static bool _test_display_on_off(void)
     }
 
     if (!_wait_ms_with_detect(WAIT_ON_OFF_MS)) {
-        s_display.ssd1306_command(SSD1306_DISPLAYON);
+        (void)_app_send_cmd1(SSD1306_DISPLAYON);
         return false;
     }
 
     // 画面ON（スリープ復帰・RAM内容維持確認）
-    s_display.ssd1306_command(SSD1306_DISPLAYON);
-    is_read_ok = _read_oled_status(&status_byte);
+    if (!_app_send_cmd1(SSD1306_DISPLAYON)) {
+        return false;
+    }
+    is_read_ok = _app_read_status(&status_byte);
     if (is_read_ok) {
         Serial.print(F("  Status(ON) : 0x"));
         Serial.print(status_byte, HEX);
@@ -299,79 +635,37 @@ static bool _test_display_on_off(void)
  */
 static bool _test_brightness(void)
 {
-    const uint8_t p_levels[] = { 0x00, 0x20, 0x7F, 0xFF };
-    uint8_t level_cnt = (uint8_t)(sizeof(p_levels) / sizeof(p_levels[0]));
     uint8_t i = 0;
 
     Serial.println(F("Brightness (Contrast) Test"));
 
-    for (i = 0; i < level_cnt; i++) {
+    for (i = 0; i < OLED_CONTRAST_LEVEL_CNT; i++) {
         s_display.clearDisplay();
         s_display.fillRect(0, 0, SCREEN_WIDTH, 12, SSD1306_WHITE);
         s_display.setTextSize(1);
         s_display.setTextColor(SSD1306_WHITE);
         s_display.setCursor(4, 18);
         s_display.print(F("CONTRAST: 0x"));
-        if (p_levels[i] < 0x10) {
+        if (OLED_CONTRAST_LEVELS[i] < 0x10U) {
             s_display.print(F("0"));
         }
-        s_display.print(p_levels[i], HEX);
-        s_display.display();
+        s_display.print(OLED_CONTRAST_LEVELS[i], HEX);
+        if (!_app_flush_display()) {
+            return false;
+        }
 
-        // コントラストレジスタ設定
-        s_display.ssd1306_command(SSD1306_SETCONTRAST);
-        s_display.ssd1306_command(p_levels[i]);
+        if (!_app_send_cmd2(SSD1306_SETCONTRAST, OLED_CONTRAST_LEVELS[i])) {
+            return false;
+        }
 
         if (!_wait_ms_with_detect(WAIT_BRIGHTNESS_MS)) {
-            s_display.ssd1306_command(SSD1306_SETCONTRAST);
-            s_display.ssd1306_command(OLED_CONTRAST_DEFAULT);
+            (void)_app_send_cmd2(SSD1306_SETCONTRAST, OLED_CONTRAST_DEFAULT);
             return false;
         }
     }
 
     // デフォルト輝度へ復帰
-    s_display.ssd1306_command(SSD1306_SETCONTRAST);
-    s_display.ssd1306_command(OLED_CONTRAST_DEFAULT);
-    return true;
-}
-
-/**
- * @brief Page Addressing Modeで指定ページ(128バイト)に任意バッファを書き込む
- */
-static bool _write_page_buffer(uint8_t page, const uint8_t *p_page_data, bool is_invert)
-{
-    uint8_t offset = 0;
-    uint8_t i = 0;
-    uint8_t err = 0;
-    uint8_t data_byte = 0;
-
-    if (p_page_data == NULL) {
-        return false;
-    }
-
-    // ページアドレス(0xB0〜0xB7)とカラム開始位置(0x00, 0x10)を指定
-    s_display.ssd1306_command((uint8_t)(0xB0U | (page & 0x07U)));
-    s_display.ssd1306_command(SSD1306_SETLOWCOLUMN | 0x00U);
-    s_display.ssd1306_command(SSD1306_SETHIGHCOLUMN | 0x00U);
-
-    // I2Cバッファ溢れ防止のため16バイト単位で分割送信
-    for (offset = 0; offset < SCREEN_WIDTH; offset += OLED_I2C_CHUNK_SIZE) {
-        Wire.beginTransmission(OLED_I2C_ADDR);
-        Wire.write((uint8_t)0x40U); // Co=0, D/C#=1 (GDDRAMデータ書き込み)
-        for (i = 0; i < OLED_I2C_CHUNK_SIZE; i++) {
-            data_byte = p_page_data[offset + i];
-            if (is_invert) {
-                data_byte = (uint8_t)(~data_byte);
-            }
-            Wire.write(data_byte);
-        }
-        err = Wire.endTransmission();
-        if (err != 0) {
-            return false;
-        }
-    }
-
-    return true;
+    return _app_send_cmd2(SSD1306_SETCONTRAST, OLED_CONTRAST_DEFAULT);
 }
 
 /**
@@ -379,14 +673,12 @@ static bool _write_page_buffer(uint8_t page, const uint8_t *p_page_data, bool is
  */
 static bool _test_page_switch(void)
 {
-    uint8_t *p_buf = NULL;
     uint8_t active_page = 0;
     uint8_t target_page = 0;
-    bool is_ok = true;
 
     Serial.println(F("Page Switch (Page Addressing Mode) Test"));
 
-    // フレームバッファ上に各ページ(8px高)のラベルを用意（転送はしない）
+    // フレームバッファ上に各ページ(8px高)のラベルを用意
     s_display.clearDisplay();
     s_display.setTextSize(1);
     s_display.setTextColor(SSD1306_WHITE);
@@ -396,50 +688,18 @@ static bool _test_page_switch(void)
         s_display.print(target_page);
     }
 
-    p_buf = s_display.getBuffer();
-    if (p_buf == NULL) {
-        return false;
-    }
-
-    // Memory Addressing ModeをPage Addressing Mode (0x02) へ変更
-    s_display.ssd1306_command(SSD1306_MEMORYMODE);
-    s_display.ssd1306_command(0x02U);
-
     for (active_page = 0; active_page < OLED_PAGE_CNT; active_page++) {
-        // 選択中のページだけを白背景・黒文字(反転)で1ページ単位書き込み
-        for (target_page = 0; target_page < OLED_PAGE_CNT; target_page++) {
-            if (!_write_page_buffer(target_page,
-                                   &p_buf[(uint16_t)target_page * SCREEN_WIDTH],
-                                    (target_page == active_page))) {
-                is_ok = false;
-                break;
-            }
-        }
-
-        if (!is_ok) {
-            break;
+        if (!_app_page_frame((uint8_t)(1U << active_page))) {
+            return false;
         }
 
         if (!_wait_ms_with_detect(WAIT_PAGE_EACH_MS)) {
-            is_ok = false;
-            break;
+            return false;
         }
     }
 
-    // Horizontal Addressing Mode (0x00) へ必ず復帰
-    s_display.ssd1306_command(SSD1306_MEMORYMODE);
-    s_display.ssd1306_command(0x00U);
-    s_display.ssd1306_command(SSD1306_COLUMNADDR);
-    s_display.ssd1306_command(0x00U);
-    s_display.ssd1306_command((uint8_t)(SCREEN_WIDTH - 1));
-    s_display.ssd1306_command(SSD1306_PAGEADDR);
-    s_display.ssd1306_command(0x00U);
-    s_display.ssd1306_command((uint8_t)(OLED_PAGE_CNT - 1));
-
     s_display.clearDisplay();
-    s_display.display();
-
-    return is_ok;
+    return _app_flush_display();
 }
 
 /**
@@ -455,7 +715,9 @@ static bool _test_checkerboard(void)
 
     Serial.println(F("Checkerboard Test"));
 
-    s_display.stopscroll();
+    if (!_app_scroll_ctrl(DRV_SCROLL_STOP, 0U, 0U)) {
+        return false;
+    }
     s_display.setRotation(0);
     p_buf = s_display.getBuffer();
 
@@ -468,9 +730,11 @@ static bool _test_checkerboard(void)
         odd_pattern  = (phase == 0) ? 0xAAU : 0x55U;
 
         for (i = 0; i < SCREEN_BUF_SIZE; i++) {
-            p_buf[i] = ((i & 0x01) == 0) ? even_pattern : odd_pattern;
+            p_buf[i] = ((i & 0x01U) == 0) ? even_pattern : odd_pattern;
         }
-        s_display.display();
+        if (!_app_flush_display()) {
+            return false;
+        }
 
         if (!_wait_ms_with_detect(WAIT_CHECKER_MS)) {
             return false;
@@ -493,15 +757,21 @@ static bool _test_invert_display(void)
     s_display.setTextColor(SSD1306_WHITE);
     s_display.setCursor(16, 8);
     s_display.print(F("INVERTED"));
-    s_display.display();
-
-    s_display.invertDisplay(true);
-    if (!_wait_ms_with_detect(WAIT_INVERT_MS)) {
-        s_display.invertDisplay(false);
+    if (!_app_flush_display()) {
         return false;
     }
 
-    s_display.invertDisplay(false);
+    if (!_app_send_cmd1(SSD1306_INVERTDISPLAY)) {
+        return false;
+    }
+    if (!_wait_ms_with_detect(WAIT_INVERT_MS)) {
+        (void)_app_send_cmd1(SSD1306_NORMALDISPLAY);
+        return false;
+    }
+
+    if (!_app_send_cmd1(SSD1306_NORMALDISPLAY)) {
+        return false;
+    }
     return _wait_ms_with_detect(WAIT_INVERT_MS);
 }
 
@@ -511,6 +781,8 @@ static bool _test_invert_display(void)
 static bool _test_hw_flip(void)
 {
     uint8_t mode = 0;
+    uint8_t seg_cmd = 0;
+    uint8_t com_cmd = 0;
 
     Serial.println(F("Hardware Mirror Flip Test"));
 
@@ -520,24 +792,29 @@ static bool _test_hw_flip(void)
     s_display.setTextColor(SSD1306_WHITE);
     s_display.setCursor(32, 8);
     s_display.print(F("HW FLIP"));
-    s_display.display();
+    if (!_app_flush_display()) {
+        return false;
+    }
 
     for (mode = 0; mode < 4; mode++) {
-        // bit0: Segment Re-map (0=Normal 0xA1, 1=Mirror 0xA0)
-        // bit1: COM Scan Dir   (0=Normal 0xC8, 1=Flip   0xC0)
-        s_display.ssd1306_command(((mode & 0x01U) != 0) ? SSD1306_SEGREMAP : (SSD1306_SEGREMAP | 0x01U));
-        s_display.ssd1306_command(((mode & 0x02U) != 0) ? SSD1306_COMSCANINC : SSD1306_COMSCANDEC);
+        seg_cmd = ((mode & 0x01U) != 0) ? SSD1306_SEGREMAP : (uint8_t)(SSD1306_SEGREMAP | 0x01U);
+        com_cmd = ((mode & 0x02U) != 0) ? SSD1306_COMSCANINC : SSD1306_COMSCANDEC;
+
+        if ((!_app_send_cmd1(seg_cmd)) || (!_app_send_cmd1(com_cmd))) {
+            return false;
+        }
 
         if (!_wait_ms_with_detect(WAIT_HW_FLIP_MS)) {
-            s_display.ssd1306_command(SSD1306_SEGREMAP | 0x01U);
-            s_display.ssd1306_command(SSD1306_COMSCANDEC);
+            (void)_app_send_cmd1(SSD1306_SEGREMAP | 0x01U);
+            (void)_app_send_cmd1(SSD1306_COMSCANDEC);
             return false;
         }
     }
 
     // 通常向きへ復帰
-    s_display.ssd1306_command(SSD1306_SEGREMAP | 0x01U);
-    s_display.ssd1306_command(SSD1306_COMSCANDEC);
+    if ((!_app_send_cmd1(SSD1306_SEGREMAP | 0x01U)) || (!_app_send_cmd1(SSD1306_COMSCANDEC))) {
+        return false;
+    }
     return true;
 }
 
@@ -558,24 +835,24 @@ static bool _test_display_offset(void)
     s_display.setCursor(16, 12);
     s_display.print(F("VERTICAL OFFSET"));
     s_display.drawFastHLine(0, SCREEN_HEIGHT - 1, SCREEN_WIDTH, SSD1306_WHITE);
-    s_display.display();
+    if (!_app_flush_display()) {
+        return false;
+    }
 
     for (step = 0; step <= 4; step++) {
         offset = (uint8_t)((step * 8U) % SCREEN_HEIGHT);
-        s_display.ssd1306_command(SSD1306_SETDISPLAYOFFSET);
-        s_display.ssd1306_command(offset);
+        if (!_app_send_cmd2(SSD1306_SETDISPLAYOFFSET, offset)) {
+            return false;
+        }
 
         if (!_wait_ms_with_detect(WAIT_OFFSET_EACH_MS)) {
-            s_display.ssd1306_command(SSD1306_SETDISPLAYOFFSET);
-            s_display.ssd1306_command(0x00U);
+            (void)_app_send_cmd2(SSD1306_SETDISPLAYOFFSET, 0x00U);
             return false;
         }
     }
 
     // オフセット0へ復帰
-    s_display.ssd1306_command(SSD1306_SETDISPLAYOFFSET);
-    s_display.ssd1306_command(0x00U);
-    return true;
+    return _app_send_cmd2(SSD1306_SETDISPLAYOFFSET, 0x00U);
 }
 
 /**
@@ -583,30 +860,28 @@ static bool _test_display_offset(void)
  */
 static bool _test_multiplex_ratio(void)
 {
-    const uint8_t p_mux_ratios[] = { 15, 23, 31 };
-    uint8_t ratio_cnt = (uint8_t)(sizeof(p_mux_ratios) / sizeof(p_mux_ratios[0]));
     uint8_t i = 0;
 
     Serial.println(F("Multiplex Ratio Test"));
 
     s_display.fillScreen(SSD1306_WHITE);
-    s_display.display();
+    if (!_app_flush_display()) {
+        return false;
+    }
 
-    for (i = 0; i < ratio_cnt; i++) {
-        s_display.ssd1306_command(SSD1306_SETMULTIPLEX);
-        s_display.ssd1306_command(p_mux_ratios[i]);
+    for (i = 0; i < OLED_MUX_RATIO_CNT; i++) {
+        if (!_app_send_cmd2(SSD1306_SETMULTIPLEX, OLED_MUX_RATIOS[i])) {
+            return false;
+        }
 
         if (!_wait_ms_with_detect(WAIT_MUX_EACH_MS)) {
-            s_display.ssd1306_command(SSD1306_SETMULTIPLEX);
-            s_display.ssd1306_command((uint8_t)(SCREEN_HEIGHT - 1));
+            (void)_app_send_cmd2(SSD1306_SETMULTIPLEX, (uint8_t)(SCREEN_HEIGHT - 1));
             return false;
         }
     }
 
     // 全ライン駆動へ復帰
-    s_display.ssd1306_command(SSD1306_SETMULTIPLEX);
-    s_display.ssd1306_command((uint8_t)(SCREEN_HEIGHT - 1));
-    return true;
+    return _app_send_cmd2(SSD1306_SETMULTIPLEX, (uint8_t)(SCREEN_HEIGHT - 1));
 }
 
 /**
@@ -634,7 +909,9 @@ static bool _test_full_text(void)
             s_display.write((uint8_t)p_chars[idx]);
         }
     }
-    s_display.display();
+    if (!_app_flush_display()) {
+        return false;
+    }
 
     return _wait_ms_with_detect(WAIT_TEXT_MS);
 }
@@ -660,7 +937,10 @@ static bool _test_rotation(void)
         s_display.print(F("ROT:"));
         s_display.print(rot * 90);
 
-        s_display.display();
+        if (!_app_flush_display()) {
+            s_display.setRotation(0);
+            return false;
+        }
 
         if (!_wait_ms_with_detect(WAIT_ROT_EACH_MS)) {
             s_display.setRotation(0);
@@ -684,93 +964,155 @@ static bool _test_scroll(void)
     s_display.setTextColor(SSD1306_WHITE);
     s_display.setCursor(10, 8);
     s_display.print(F("SCROLL OK"));
-    s_display.display();
+    if (!_app_flush_display()) {
+        return false;
+    }
 
     // 水平右スクロール
-    s_display.startscrollright(0x00, 0x03);
+    if (!_app_scroll_ctrl(DRV_SCROLL_RIGHT, 0x00U, 0x03U)) {
+        return false;
+    }
     if (!_wait_ms_with_detect(WAIT_SCROLL_EACH_MS)) {
-        s_display.stopscroll();
+        (void)_app_scroll_ctrl(DRV_SCROLL_STOP, 0U, 0U);
         return false;
     }
 
     // 水平左スクロール
-    s_display.startscrollleft(0x00, 0x03);
+    if (!_app_scroll_ctrl(DRV_SCROLL_LEFT, 0x00U, 0x03U)) {
+        return false;
+    }
     if (!_wait_ms_with_detect(WAIT_SCROLL_EACH_MS)) {
-        s_display.stopscroll();
+        (void)_app_scroll_ctrl(DRV_SCROLL_STOP, 0U, 0U);
         return false;
     }
 
     // 斜め右スクロール（垂直＋水平同時）
-    s_display.startscrolldiagright(0x00, 0x03);
+    if (!_app_scroll_ctrl(DRV_SCROLL_DIAG_RIGHT, 0x00U, 0x03U)) {
+        return false;
+    }
     if (!_wait_ms_with_detect(WAIT_SCROLL_EACH_MS)) {
-        s_display.stopscroll();
+        (void)_app_scroll_ctrl(DRV_SCROLL_STOP, 0U, 0U);
         return false;
     }
 
     // 斜め左スクロール（垂直＋水平同時）
-    s_display.startscrolldiagleft(0x00, 0x03);
+    if (!_app_scroll_ctrl(DRV_SCROLL_DIAG_LEFT, 0x00U, 0x03U)) {
+        return false;
+    }
     if (!_wait_ms_with_detect(WAIT_SCROLL_EACH_MS)) {
-        s_display.stopscroll();
+        (void)_app_scroll_ctrl(DRV_SCROLL_STOP, 0U, 0U);
         return false;
     }
 
-    s_display.stopscroll();
-    return true;
+    return _app_scroll_ctrl(DRV_SCROLL_STOP, 0U, 0U);
 }
 
-// -----------------------------------------------------------
-// [main()]
+// ===========================================================
+// [エントリポイント: Core 0 (ドライバCPU)]
+// ===========================================================
 
 /**
- * @brief メイン初期化
+ * @brief Core 0 初期化 (I2Cバス・ドライバ層初期化)
  */
 void setup(void)
 {
-    Serial.begin(115200);
     Wire.begin();
-    Wire.setClock(400000);
-    Serial.println(F("OLED Batch Inspection Ready."));
+    Wire.setClock(I2C_SCL_DEF);
+    s_last_poll_ms = millis();
+    g_is_core0_ready = true;
 }
 
 /**
- * @brief メインループ
+ * @brief Core 0 メインループ (FIFOコマンド実行 & ホットプラグ監視)
  */
 void loop(void)
 {
-    uint8_t i = 0;
+    uint32_t msg = 0;
+    uint32_t now_ms = 0;
     bool is_init_ok = false;
-    bool is_ret = false;
 
-    // OLEDがつながってるかポーリング
-    if (!s_is_connected) {
-        if (_is_oled_ack()) {
-            delay(50);
-            is_init_ok = s_display.begin(SSD1306_SWITCHCAPVCC, OLED_I2C_ADDR);
-            if (is_init_ok) {
-                s_is_connected = true;
-                Serial.println(F("=== New OLED Detected: Start Inspection ==="));
+    // 1. Core 1からのドライバコマンド要求を最優先処理
+    while (rp2040.fifo.pop_nb(&msg)) {
+        _drv_handle_fifo_msg(msg);
+    }
+
+    // 2. 定期I2C ACKポーリングによる接続・抜去監視
+    now_ms = millis();
+    if ((now_ms - s_last_poll_ms) >= POLL_INTERVAL_MS) {
+        s_last_poll_ms = now_ms;
+
+        if (!g_is_oled_connected) {
+            if (_drv_is_oled_ack()) {
+                delay(50);
+                is_init_ok = s_display.begin(SSD1306_SWITCHCAPVCC, OLED_I2C_ADDR);
+                if (is_init_ok) {
+                    g_is_oled_connected = true;
+                }
             }
         } else {
-            delay(POLL_INTERVAL_MS);
+            if (!_drv_is_oled_ack()) {
+                g_is_oled_connected = false;
+            }
         }
+    }
+
+    tight_loop_contents();
+}
+
+// ===========================================================
+// [エントリポイント: Core 1 (アプリCPU)]
+// ===========================================================
+
+/**
+ * @brief Core 1 初期化 (Serialログ・アプリ層初期化)
+ */
+void setup1(void)
+{
+    Serial.begin(115200);
+    while (!g_is_core0_ready) {
+        tight_loop_contents();
+    }
+    Serial.println(F("OLED Dual-Core Batch Inspection Ready (Core0:Driver / Core1:App)."));
+}
+
+/**
+ * @brief Core 1 メインループ (検査シーケンス実行)
+ */
+void loop1(void)
+{
+    static bool s_is_prev_connected = false;
+    uint8_t i = 0;
+    bool is_connected = g_is_oled_connected;
+    bool is_ret = false;
+
+    // 接続状態のエッジ検出とログ通知
+    if (is_connected && (!s_is_prev_connected)) {
+        Serial.println(F("=== New OLED Detected: Start Inspection ==="));
+    } else if ((!is_connected) && s_is_prev_connected) {
+        Serial.println(F("OLED Disconnected. Waiting for next unit..."));
+    }
+    s_is_prev_connected = is_connected;
+
+    if (!is_connected) {
+        delay(10);
         return;
     }
 
-    // 検査関数のテーブルを回す
-    for (i = 0; i < OLED_TEST_FUNC_TBL_CNT; i++)
-    {
+    // 検査関数のテーブルを順次実行
+    for (i = 0; i < OLED_TEST_FUNC_TBL_CNT; i++) {
+        if (!g_is_oled_connected) {
+            return;
+        }
+
         Serial.print(F("["));
         Serial.print(i + 1);
         Serial.print(F("/"));
         Serial.print(OLED_TEST_FUNC_TBL_CNT);
         Serial.println(F("] Executing..."));
 
-        // 検査関数実行
         is_ret = s_oled_test_func_tbl[i]();
-
         if (!is_ret) {
             return;
         }
     }
 }
-// -----------------------------------------------------------
